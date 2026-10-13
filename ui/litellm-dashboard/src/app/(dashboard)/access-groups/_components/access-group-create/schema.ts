@@ -6,6 +6,7 @@ export const accessGroupCreateSchema = z.object({
   modelIds: z.array(z.string()),
   mcpServerIds: z.array(z.string()),
   agentIds: z.array(z.string()),
+  skillNames: z.array(z.string()),
 });
 
 export type AccessGroupCreateFormValues = z.output<typeof accessGroupCreateSchema>;

@@ -3411,6 +3411,16 @@ class TeamNotFoundError(HTTPException):
         super().__init__(status_code=404, detail=detail)
 
 
+class AccessGroupNotFoundError(HTTPException):
+    """The access-group lookup returned no row rather than failing."""
+
+    def __init__(self, access_group_id: str) -> None:
+        detail: Final[_TeamNotFoundDetail] = {
+            "error": f"Access group doesn't exist in db. Access group={access_group_id}."
+        }
+        super().__init__(status_code=404, detail=detail)
+
+
 @log_db_metrics
 async def _get_team_db_check(
     team_id: str, prisma_client: PrismaClient, team_id_upsert: bool | None = None, *, use_writer: bool = False
@@ -3667,10 +3677,7 @@ async def get_access_object(
         ).find_unique(where={"access_group_id": access_group_id})
 
         if response is None:
-            raise HTTPException(
-                status_code=404,
-                detail={"error": f"Access group doesn't exist in db. Access group={access_group_id}."},
-            )
+            raise AccessGroupNotFoundError(access_group_id=access_group_id)
 
         _response: Final = LiteLLM_AccessGroupTable.model_validate(response.dict())
 
@@ -4534,11 +4541,12 @@ async def get_org_object_for_request(
 
 async def _get_resources_from_access_groups(
     access_group_ids: Sequence[str],
-    resource_field: Literal["access_model_names", "access_mcp_server_ids", "access_agent_ids"],
+    resource_field: Literal["access_model_names", "access_mcp_server_ids", "access_agent_ids", "access_skill_names"],
     prisma_client: DatabaseClient | None = None,
     user_api_key_cache: UserApiKeyCache | None = None,
     proxy_logging_obj: ProxyLogging | None = None,
     check_db_only: bool = False,
+    strict_errors: bool = False,
 ) -> list[str]:
     """
     Fetch access groups by their IDs (from cache or DB) and collect
@@ -4584,8 +4592,11 @@ async def _get_resources_from_access_groups(
                 check_db_only=check_db_only,
             )
             resources.extend(getattr(ag, resource_field, []))
+        except AccessGroupNotFoundError:
+            if check_db_only or strict_errors:
+                raise
         except Exception:
-            if check_db_only:
+            if check_db_only or strict_errors:
                 raise
             verbose_proxy_logger.debug(
                 "Could not fetch access group %s for resource field %s",
@@ -4663,6 +4674,28 @@ async def get_agent_ids_from_access_groups(
 
 
 _get_agent_ids_from_access_groups: Final = get_agent_ids_from_access_groups
+
+
+async def get_skill_names_from_access_groups(
+    access_group_ids: Sequence[str],
+    prisma_client: PrismaClient | None = None,
+    user_api_key_cache: UserApiKeyCache | None = None,
+    proxy_logging_obj: ProxyLogging | None = None,
+    check_db_only: bool = False,
+    strict_errors: bool = False,
+) -> frozenset[str]:
+    """Claude Code plugin names granted by unified access groups, matched by plugin name."""
+    return frozenset(
+        await _get_resources_from_access_groups(
+            access_group_ids=access_group_ids,
+            resource_field="access_skill_names",
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+            check_db_only=check_db_only,
+            strict_errors=strict_errors,
+        )
+    )
 
 
 def _resolve_all_team_model_sentinel_for_auth_check(
@@ -5584,7 +5617,9 @@ async def can_team_access_model(
 async def get_authorized_resources_from_key_access_groups(
     valid_token: UserAPIKeyAuth | None,
     team_object: LiteLLM_TeamTable | None,
-    resource_field: Literal["access_model_names", "access_mcp_server_ids", "access_agent_ids"],
+    resource_field: Literal["access_model_names", "access_mcp_server_ids", "access_agent_ids", "access_skill_names"],
+    check_db_only: bool = False,
+    strict_errors: bool = False,
 ) -> list[str]:
     """
     For each access_group_id on the key, fetch the LiteLLM_AccessGroupTable row
@@ -5618,8 +5653,15 @@ async def get_authorized_resources_from_key_access_groups(
                 prisma_client=_prisma_client,
                 user_api_key_cache=_user_api_key_cache,
                 proxy_logging_obj=_proxy_logging_obj,
+                check_db_only=check_db_only,
             )
+        except AccessGroupNotFoundError:
+            if check_db_only or strict_errors:
+                raise
+            continue
         except Exception:
+            if check_db_only or strict_errors:
+                raise
             continue
         team_authorized = bool(key_team_id and key_team_id in (ag.assigned_team_ids or []))
         key_authorized = bool(key_token and key_token in (ag.assigned_key_ids or []))
