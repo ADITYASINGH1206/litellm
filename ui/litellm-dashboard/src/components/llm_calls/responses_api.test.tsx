@@ -6,6 +6,7 @@ import type { TokenUsage } from "../chat_ui/ResponseMetrics";
 
 vi.mock("@/components/networking", () => ({
   getProxyBaseUrl: vi.fn(() => "https://example.com"),
+  getGatewayBaseUrl: vi.fn(() => "https://gateway.example.com"),
 }));
 
 const mockResponsesCreate = vi.fn();
@@ -59,6 +60,7 @@ describe("responses_api", () => {
   it("should send a basic responses request", async () => {
     await makeOpenAIResponsesRequest(messages, mockUpdateTextUI, "gpt-4", "test-token");
 
+    expect(openai.OpenAI).toHaveBeenCalledWith(expect.objectContaining({ baseURL: "https://gateway.example.com" }));
     expect(mockResponsesCreate).toHaveBeenCalledTimes(1);
     expect(mockResponsesCreate).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -403,14 +405,14 @@ describe("responses_api", () => {
       {
         type: "mcp",
         server_label: "Alpha",
-        server_url: "https://example.com/mcp/Alpha",
+        server_url: "https://gateway.example.com/mcp/Alpha",
         require_approval: "never",
         allowed_tools: ["toolA"],
       },
       {
         type: "mcp",
         server_label: "Beta",
-        server_url: "https://example.com/mcp/Beta",
+        server_url: "https://gateway.example.com/mcp/Beta",
         require_approval: "never",
         allowed_tools: ["toolB", "toolC"],
       },

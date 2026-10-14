@@ -15,6 +15,7 @@ vi.mock("@/components/networking", () => ({
   deleteMCPToolset: vi.fn(),
   listMCPTools: vi.fn(),
   getProxyBaseUrl: vi.fn().mockReturnValue("http://localhost:4000"),
+  getGatewayBaseUrl: vi.fn().mockReturnValue("http://localhost:4000"),
 }));
 
 vi.mock("@/app/(dashboard)/hooks/mcpServers/useMCPToolsets", () => ({ useMCPToolsets: vi.fn() }));

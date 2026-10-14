@@ -58,7 +58,17 @@ spec:
               protocol: TCP
           env:
             {{- include "litellm.lensConnectionEnv" . | nindent 12 }}
+            {{- if .Values.ui.publicUrl }}
+            - name: LITELLM_CORS_ORIGINS
+              value: {{ .Values.ui.publicUrl | quote }}
+            - name: LITELLM_CORS_ALLOW_CREDENTIALS
+              value: "true"
+            {{- end }}
             {{- include "litellm.serverEnv" (dict "root" $ "component" .Values.backend) | nindent 12 }}
+            {{- if .Values.backend.gatewayUrl }}
+            - name: LITELLM_GATEWAY_URL
+              value: {{ .Values.backend.gatewayUrl | quote }}
+            {{- end }}
             {{- if .Values.gateway.config.create }}
             - name: CONFIG_FILE_PATH
               value: /app/config/config.yaml

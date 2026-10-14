@@ -237,7 +237,7 @@ describe("UI config and public endpoints", () => {
     // Then call the public endpoint
     await Networking.getProviderCreateMetadata();
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     const publicEndpointCall = mockFetch.mock.calls.find((call) =>
       (call[0] as string).includes("/public/providers/fields"),
     );
@@ -260,7 +260,7 @@ describe("UI config and public endpoints", () => {
     await Networking.getUiConfig();
     await Networking.getPublicModelHubInfo();
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     const publicEndpointCall = mockFetch.mock.calls.find((call) =>
       (call[0] as string).includes("/public/model_hub/info"),
     );
@@ -283,7 +283,7 @@ describe("UI config and public endpoints", () => {
     await Networking.getUiConfig();
     await Networking.modelHubPublicModelsCall();
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     const publicEndpointCall = mockFetch.mock.calls.find(
       (call) => (call[0] as string).includes("/public/model_hub") && !(call[0] as string).includes("/info"),
     );
@@ -306,7 +306,7 @@ describe("UI config and public endpoints", () => {
     await Networking.getUiConfig();
     await Networking.agentHubPublicModelsCall();
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     const publicEndpointCall = mockFetch.mock.calls.find((call) => (call[0] as string).includes("/public/agent_hub"));
     expect(publicEndpointCall).toBeDefined();
     const calledUrl = publicEndpointCall![0] as string;
@@ -327,7 +327,7 @@ describe("UI config and public endpoints", () => {
     await Networking.getUiConfig();
     await Networking.mcpHubPublicServersCall();
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     const publicEndpointCall = mockFetch.mock.calls.find((call) => (call[0] as string).includes("/public/mcp_hub"));
     expect(publicEndpointCall).toBeDefined();
     const calledUrl = publicEndpointCall![0] as string;
@@ -348,7 +348,7 @@ describe("UI config and public endpoints", () => {
     await Networking.getUiConfig();
     await Networking.getProviderCreateMetadata();
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     const publicEndpointCall = mockFetch.mock.calls.find((call) =>
       (call[0] as string).includes("/public/providers/fields"),
     );
@@ -367,7 +367,7 @@ describe("UI config and public endpoints", () => {
 
     const result = await Networking.getUiConfig();
 
-    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
     expect(result).toEqual(uiConfig);
     const configCall = mockFetch.mock.calls.find((call) =>
       (call[0] as string).includes("/litellm/.well-known/litellm-ui-config"),
@@ -935,5 +935,95 @@ describe("modelCostMap", () => {
 
     expect(mockFetch.mock.calls[0][0]).toMatch(/\/public\/litellm_model_cost_map\?catalog_only=true$/);
     expect(mockFetch.mock.calls[1][0]).toMatch(/\/public\/litellm_model_cost_map$/);
+  });
+});
+
+describe("getUiConfig runtime backend discovery", () => {
+  const discoveryConfig = () => ({
+    server_root_path: "/",
+    proxy_base_url: null,
+    gateway_base_url: null,
+    auto_redirect_to_sso: false,
+    admin_ui_disabled: false,
+    sso_configured: false,
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  const loadFreshNetworking = async () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", {
+      location: { origin: "https://ui.example.com" },
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+        clear: () => storage.clear(),
+      },
+    });
+    vi.stubEnv("NEXT_PUBLIC_BASE_URL", "");
+    vi.stubEnv("NEXT_PUBLIC_USE_REWRITES", "true");
+    vi.resetModules();
+    return import("./networking");
+  };
+
+  it("uses a normalized runtime backend URL for discovery and the management fallback", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ backend_url: "  https://backend.example.com///  " }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ...discoveryConfig(),
+          gateway_base_url: "  https://gateway.example.com/// ",
+        }),
+      } as Response);
+    vi.stubGlobal("fetch", mockFetch);
+    const networking = await loadFreshNetworking();
+
+    await networking.getUiConfig();
+
+    expect(mockFetch).toHaveBeenNthCalledWith(1, "/ui/litellm-runtime-config.json", { cache: "no-store" });
+    expect(mockFetch.mock.calls[1][0]).toBe("https://backend.example.com/litellm/.well-known/litellm-ui-config");
+    expect(networking.getProxyBaseUrl().replace(/\/+$/, "")).toBe("https://backend.example.com");
+    expect(networking.getGatewayBaseUrl()).toBe("https://gateway.example.com");
+
+    networking.switchToWorkerUrl("https://worker.example.com");
+    expect(networking.getGatewayBaseUrl()).toBe("https://worker.example.com");
+    networking.switchToWorkerUrl(null);
+    expect(networking.getGatewayBaseUrl()).toBe("https://gateway.example.com");
+  });
+
+  it.each([
+    ["404", { ok: false }],
+    [
+      "HTML 200",
+      {
+        ok: true,
+        json: async () => {
+          throw new SyntaxError("Unexpected token '<'");
+        },
+      },
+    ],
+  ])("keeps discovery behavior when runtime config returns %s", async (_label, runtimeResponse) => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeResponse as Response)
+      .mockResolvedValueOnce({ ok: true, json: async () => discoveryConfig() } as Response);
+    vi.stubGlobal("fetch", mockFetch);
+    const networking = await loadFreshNetworking();
+
+    await networking.getUiConfig();
+
+    expect(mockFetch).toHaveBeenNthCalledWith(1, "/ui/litellm-runtime-config.json", { cache: "no-store" });
+    expect(mockFetch.mock.calls[1][0]).toBe("/litellm/.well-known/litellm-ui-config");
+    expect(networking.getGatewayBaseUrl()).toBe(networking.getProxyBaseUrl());
   });
 });

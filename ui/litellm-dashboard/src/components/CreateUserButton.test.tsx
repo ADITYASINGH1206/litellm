@@ -19,6 +19,7 @@ vi.mock("./networking", () => ({
     SSO_ENABLED: false,
   }),
   getProxyBaseUrl: vi.fn().mockReturnValue("http://localhost"),
+  getUiPageUrl: (url: string) => url,
 }));
 
 vi.mock("@/app/(dashboard)/hooks/organizations/useOrganizations", () => ({
