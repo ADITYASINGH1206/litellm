@@ -63,9 +63,8 @@ def _lazy_owner_collectors() -> tuple[Collector, ...]:
     in_flight: Final = InFlightRequestsMiddleware._get_gauge()
     assert in_flight is not None
     breaker: Final = _breaker_metrics()
-    assert breaker._state_gauge is not None
-    assert breaker._transitions is not None
-    assert breaker._failures is not None
+    breaker.publish()
+    assert breaker._collectors is not None
     return (
         SpendLogCleanupMetrics.rows_deleted,
         SpendLogCleanupMetrics.batch_duration,
@@ -73,9 +72,9 @@ def _lazy_owner_collectors() -> tuple[Collector, ...]:
         SpendLogCleanupMetrics.batch_failures,
         SpendLogCleanupMetrics.runs,
         in_flight,
-        breaker._state_gauge,
-        breaker._transitions,
-        breaker._failures,
+        breaker._collectors.state,
+        breaker._collectors.transitions,
+        breaker._collectors.failures,
     )
 
 
