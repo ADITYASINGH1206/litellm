@@ -1,5 +1,7 @@
 """App factory for the LiteLLM global control plane. Enterprise only: refuses to build without a valid license."""
 
+from dataclasses import dataclass
+from types import TracebackType
 from typing import Final, Protocol
 
 from fastapi import FastAPI
@@ -32,12 +34,29 @@ class LicenseRequired(RuntimeError):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _Lifespan:
+    container: Container
+
+    def __call__(self, app: FastAPI) -> "_Lifespan":
+        return self
+
+    async def __aenter__(self) -> None:
+        self.container.audit_log.pipeline.start()
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        await self.container.audit_log.pipeline.close()
+
+
 def create_app(container: Container, license_check: License) -> FastAPI:
     if not license_check.is_premium():
         raise LicenseRequired()
     app: Final = FastAPI(
         title=TITLE,
         version="1",
+        lifespan=_Lifespan(container),
         docs_url=f"{container.settings.api_prefix}/docs",
         openapi_url=f"{container.settings.api_prefix}/openapi.json",
     )
