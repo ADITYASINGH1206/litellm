@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Optional, Protocol, Union
@@ -1021,7 +1022,11 @@ class ProxyExtrasDBManager:
     def _setup_database_v2(use_migrate: bool) -> bool:
         if not use_migrate:
             return ProxyExtrasDBManager._run_database_v2(False)
-        from litellm_proxy_extras.migration_lock import migration_environment, migration_lock
+        from litellm_proxy_extras.migration_lock import (
+            migration_environment,
+            migration_lock,
+            prisma_migration_lock,
+        )
         from litellm_proxy_extras.migration_recovery import (
             baseline_current_schema,
             recover_completed_migration,
@@ -1055,7 +1060,9 @@ class ProxyExtrasDBManager:
                     migration_environment(_get_prisma_env()),
                 )
 
-        while not ProxyExtrasDBManager._run_database_v2(True, recover_completed, baseline_existing):
+        while not ProxyExtrasDBManager._run_database_v2(
+            True, recover_completed, baseline_existing, lambda: prisma_migration_lock(lock_url)
+        ):
             continue
         return True
 
@@ -1064,6 +1071,7 @@ class ProxyExtrasDBManager:
         use_migrate: bool,
         recover_completed: Callable[[str], bool] = lambda name: False,
         baseline_existing: "Callable[[str], None] | None" = None,
+        deploy_lock: Callable[[], AbstractContextManager[None]] = nullcontext,
     ) -> bool:
         """
         v2 migration resolver (opt-in via --use_v2_migration_resolver).
@@ -1126,11 +1134,12 @@ class ProxyExtrasDBManager:
             while not budget.exhausted:
                 attempt_started = time.monotonic()
                 try:
-                    result = prisma_toolchain.run_prisma(
-                        [_get_prisma_command(), "migrate", "deploy"],
-                        timeout=deploy_timeout,
-                        env=migration_env,
-                    )
+                    with deploy_lock():
+                        result = prisma_toolchain.run_prisma(
+                            [_get_prisma_command(), "migrate", "deploy"],
+                            timeout=deploy_timeout,
+                            env=migration_env,
+                        )
                     logger.info(f"prisma migrate deploy stdout: {result.stdout}")
                     return True
 

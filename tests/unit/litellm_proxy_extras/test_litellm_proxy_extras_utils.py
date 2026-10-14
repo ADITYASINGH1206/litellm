@@ -2083,3 +2083,73 @@ def test_repair_survives_an_unreachable_database(monkeypatch: pytest.MonkeyPatch
 
     assert ProxyExtrasDBManager.repair_invalid_indexes() is False
 
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        {"DATABASE_URL": "postgresql://pool/db"},
+        {"DATABASE_URL": "postgresql://pool/db?pgbouncer=true", "DIRECT_URL": "postgresql://writer/db"},
+    ),
+    ids=("pooled-only", "pooled-with-direct"),
+)
+def test_prisma_runs_its_migrations_without_a_session_advisory_lock(environment):
+    from litellm_proxy_extras.migration_lock import migration_environment
+
+    migrated = migration_environment(environment)
+
+    assert migrated["PRISMA_SCHEMA_DISABLE_ADVISORY_LOCK"] == "1"
+    assert "PRISMA_SCHEMA_DISABLE_ADVISORY_LOCK" not in migration_environment({"PRISMA_OFFLINE_MODE": "true"})
+
+
+class TestMigrateDeployRunsUnderTheCoordinatorLock:
+    """`prisma migrate deploy` only runs while the injected lock is held, and the lock is
+    released again before the resolver handles the outcome, success or failure."""
+
+    @staticmethod
+    def _recording_lock(events: list[str]):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def lock():
+            events.append("lock")
+            try:
+                yield
+            finally:
+                events.append("unlock")
+
+        return lock
+
+    def test_deploy_runs_between_lock_and_unlock(self, monkeypatch, tmp_path):
+        import litellm_proxy_extras.utils as utils_module
+
+        events: list[str] = []
+        harness = _MigrateDeployHarness(monkeypatch, tmp_path, ["ok"])
+        original_run = harness._fake_run
+
+        def run_and_record(cmd, **kwargs):
+            events.append("deploy")
+            return original_run(cmd, **kwargs)
+
+        monkeypatch.setattr(utils_module.prisma_toolchain, "run_prisma", run_and_record)
+
+        assert ProxyExtrasDBManager._run_database_v2(True, deploy_lock=self._recording_lock(events)) is True
+        assert events == ["lock", "deploy", "unlock"]
+
+    def test_a_failed_deploy_releases_the_lock_before_the_retry(self, monkeypatch, tmp_path):
+        import litellm_proxy_extras.utils as utils_module
+
+        events: list[str] = []
+        harness = _MigrateDeployHarness(
+            monkeypatch, tmp_path, ["Error: P1002\nTimed out waiting for the advisory lock", "ok"]
+        )
+        original_run = harness._fake_run
+
+        def run_and_record(cmd, **kwargs):
+            events.append("deploy")
+            return original_run(cmd, **kwargs)
+
+        monkeypatch.setattr(utils_module.prisma_toolchain, "run_prisma", run_and_record)
+
+        assert ProxyExtrasDBManager._run_database_v2(True, deploy_lock=self._recording_lock(events)) is True
+        assert events == ["lock", "deploy", "unlock", "lock", "deploy", "unlock"]
