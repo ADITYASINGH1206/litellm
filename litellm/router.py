@@ -730,6 +730,16 @@ class _StreamRetriesExhausted:
 _StreamRetryOutcome: TypeAlias = _StreamRetryOpened | _StreamRetriesExhausted
 
 
+@dataclass(frozen=True, slots=True)
+class _ChatStreamRetryOpened:
+    response: CustomStreamWrapper
+    attempted_retries: int
+    max_retries: int
+
+
+_ChatStreamRetryOutcome: TypeAlias = _ChatStreamRetryOpened | _StreamRetriesExhausted
+
+
 MAX_HELD_PRE_OUTPUT_RESPONSES_EVENTS: Final = 200
 
 
@@ -2795,7 +2805,10 @@ class Router:
             # Wrap streaming responses so MidStreamFallbackError (raised
             # during iteration) triggers the Router's fallback chain.
             if isinstance(response, CustomStreamWrapper):
-                carry_over_routed_deployment(live_kwargs=kwargs, snapshot=input_kwargs_for_streaming_fallback)
+                carry_over_routed_deployment(
+                    live_kwargs=cast("Mapping[str, object]", kwargs),  # cast-ok: the live request kwargs
+                    snapshot=input_kwargs_for_streaming_fallback,
+                )
                 return self._completion_streaming_iterator(
                     model_response=response,
                     messages=messages,
@@ -3040,9 +3053,8 @@ class Router:
 
         fallback_hidden_params, fallback_headers = prepared_fallback_hidden_params
         item_hidden_params: Final = get_hidden_params_dict(fallback_item)
-        item_headers = item_hidden_params.get("additional_headers")
-        if not isinstance(item_headers, dict):
-            item_headers = {}
+        found_headers: Final = item_hidden_params.get("additional_headers")
+        item_headers: Final[Mapping[str, object]] = found_headers if isinstance(found_headers, Mapping) else {}
 
         set_hidden_params(
             fallback_item,
@@ -3055,34 +3067,66 @@ class Router:
 
     @staticmethod
     def _adopt_retried_chat_stream(
-        opened: _StreamRetryOpened, wrapper_ref: "weakref.ref[FallbackAwareStreamWrapper]"
+        opened: _ChatStreamRetryOpened, wrapper: "FallbackAwareStreamWrapper | None"
     ) -> tuple[dict[str, object], dict[str, object]]:  # mutable-ok: _apply_fallback_hidden_params_to_item's type
         """Repoint the wrapper at the retried stream and stamp the retry headers a pre-stream retry would have."""
-        prepared: Final = Router._adopt_fallback_response_headers(wrapper_ref, opened.response)
-        adopting_wrapper: Final = wrapper_ref()
-        if adopting_wrapper is not None:
+        prepared: Final = Router._prepare_fallback_hidden_params(opened.response)
+        if wrapper is not None:
+            wrapper.adopt_fallback_response_headers(opened.response, prepared)
             add_retry_headers_to_response(
-                response=adopting_wrapper, attempted_retries=opened.attempted_retries, max_retries=opened.max_retries
+                response=wrapper, attempted_retries=opened.attempted_retries, max_retries=opened.max_retries
             )
         return prepared
 
     @staticmethod
     def _retried_chat_stream_items(
-        opened: _StreamRetryOpened, wrapper_ref: "weakref.ref[FallbackAwareStreamWrapper]"
-    ) -> Iterator[object]:
-        hidden_params: Final = Router._adopt_retried_chat_stream(opened, wrapper_ref)
-        for item in cast(Iterable[object], opened.response):  # cast-ok: _completion returned a stream
+        opened: _ChatStreamRetryOpened, wrapper: "FallbackAwareStreamWrapper | None"
+    ) -> Iterator[ModelResponseStream]:
+        hidden_params: Final = Router._adopt_retried_chat_stream(opened, wrapper)
+        for item in opened.response:
             Router._apply_fallback_hidden_params_to_item(item, hidden_params)
             yield item
 
     def _chat_stream_retry_kwargs(
-        self, model_group: str, messages: Sequence[Mapping[str, str]], initial_kwargs: Mapping[str, object]
-    ) -> Mapping[str, object]:
-        return MappingProxyType({**mid_stream_retry_kwargs(initial_kwargs), "model": model_group, "messages": messages})
+        self, initial_kwargs: Mapping[str, object]
+    ) -> dict[str, object]:  # mutable-ok: log_retry's type
+        return {
+            key: value
+            for key, value in mid_stream_retry_kwargs(initial_kwargs).items()
+            if key not in ("model", "messages")
+        }
+
+    def _chat_stream_retry_delay(
+        self,
+        trigger: Exception,
+        attempt: int,
+        budget: int,
+        policy_applies: bool,
+        deployments: tuple[list[dict[str, object]], list[dict[str, object]]],  # mutable-ok: healthy deployments
+        initial_kwargs: Mapping[str, object],
+        retry_kwargs: dict[str, object],  # mutable-ok: log_retry's own parameter type
+    ) -> float | None:
+        """Seconds to wait before retry `attempt`, or None when should_retry_this_error declines the error."""
+        healthy_deployments, all_deployments = deployments
+        if not policy_applies and not self._anthropic_messages_should_retry(
+            trigger, healthy_deployments, all_deployments, initial_kwargs
+        ):
+            return None
+        self.log_retry(kwargs=retry_kwargs, e=trigger)
+        return self._time_to_sleep_before_retry(
+            e=trigger,
+            remaining_retries=budget - attempt,
+            num_retries=budget,
+            healthy_deployments=healthy_deployments,
+            all_deployments=all_deployments,
+        )
 
     async def _aretry_chat_stream_before_content(
-        self, e: "MidStreamFallbackError", messages: Sequence[Mapping[str, str]], initial_kwargs: Mapping[str, object]
-    ) -> _StreamRetryOutcome:
+        self,
+        e: "MidStreamFallbackError",
+        messages: list[dict[str, str]],  # mutable-ok: _acompletion's own parameter type
+        initial_kwargs: Mapping[str, object],
+    ) -> _ChatStreamRetryOutcome:
         """
         Re-runs a chat completions stream that failed before its first chunk within its own model group, the
         way async_function_with_retries would have for a failure raised before the stream opened. Each retry's
@@ -3091,34 +3135,32 @@ class Router:
         the fallback chain.
         """
         model_group: Final = cast(str, initial_kwargs.get("model"))  # cast-ok: kwargs always carries the model group
-        retry_kwargs: Final = self._chat_stream_retry_kwargs(model_group, messages, initial_kwargs)
-        healthy_deployments, all_deployments = await self._async_get_healthy_deployments(
+        retry_kwargs: Final = self._chat_stream_retry_kwargs(initial_kwargs)
+        deployments: Final = await self._async_get_healthy_deployments(
             model=model_group, parent_otel_span=get_parent_otel_span_from_kwargs(retry_kwargs)
         )
         budget, policy_applies = self._anthropic_messages_retry_budget(_mid_stream_retry_trigger(e), initial_kwargs)
         last_error = e  # rebind-ok: the newest failure is what the fallback chain and the caller see
         for attempt in range(attempted_retries_for_request(initial_kwargs), budget):
-            trigger = _mid_stream_retry_trigger(last_error)
-            if not policy_applies and not self._anthropic_messages_should_retry(
-                trigger, healthy_deployments, all_deployments, initial_kwargs
-            ):
-                return _StreamRetriesExhausted(last_error)
-            self.log_retry(kwargs=retry_kwargs, e=trigger)
-            await asyncio.sleep(
-                self._time_to_sleep_before_retry(
-                    e=trigger,
-                    remaining_retries=budget - attempt,
-                    num_retries=budget,
-                    healthy_deployments=healthy_deployments,
-                    all_deployments=all_deployments,
+            if (
+                delay := self._chat_stream_retry_delay(
+                    _mid_stream_retry_trigger(last_error),
+                    attempt,
+                    budget,
+                    policy_applies,
+                    deployments,
+                    initial_kwargs,
+                    retry_kwargs,
                 )
-            )
+            ) is None:
+                return _StreamRetriesExhausted(last_error)
+            await asyncio.sleep(delay)
             record_retry_attempt(retry_kwargs, attempted_retries=attempt + 1, max_retries=budget)
             verbose_router_logger.debug(
                 "Retrying chat completions stream that failed before content, attempt %s of %s", attempt + 1, budget
             )
             try:
-                response = await self._acompletion(**retry_kwargs)
+                response = await self._acompletion(model_group, messages, **retry_kwargs)
             except Exception as retry_error:  # noqa: BLE001  # the fallback chain judges the failed retry
                 wrapped = _anthropic_stream_fallback_error_for_raised(retry_error, model_group, False, e.llm_provider)
                 if wrapped is None:
@@ -3127,43 +3169,49 @@ class Router:
                     )
                 last_error = wrapped
                 continue
-            return _StreamRetryOpened(response, attempted_retries=attempt + 1, max_retries=budget)
+            return _ChatStreamRetryOpened(
+                cast(CustomStreamWrapper, response),  # cast-ok: a stream request's attempt is the wrapped stream
+                attempted_retries=attempt + 1,
+                max_retries=budget,
+            )
         return _StreamRetriesExhausted(last_error)
 
     def _retry_chat_stream_before_content(
-        self, e: "MidStreamFallbackError", messages: Sequence[Mapping[str, str]], initial_kwargs: Mapping[str, object]
-    ) -> _StreamRetryOutcome:
+        self,
+        e: "MidStreamFallbackError",
+        messages: list[dict[str, str]],  # mutable-ok: _completion's own parameter type
+        initial_kwargs: Mapping[str, object],
+    ) -> _ChatStreamRetryOutcome:
         """The sync twin of _aretry_chat_stream_before_content, for router.completion(stream=True)."""
         model_group: Final = cast(str, initial_kwargs.get("model"))  # cast-ok: kwargs always carries the model group
-        retry_kwargs: Final = self._chat_stream_retry_kwargs(model_group, messages, initial_kwargs)
-        deployments: Final = self._get_healthy_deployments(
-            model=model_group, parent_otel_span=get_parent_otel_span_from_kwargs(retry_kwargs)
+        retry_kwargs: Final = self._chat_stream_retry_kwargs(initial_kwargs)
+        deployments: Final = run_async_function(
+            self._async_get_healthy_deployments,
+            model=model_group,
+            parent_otel_span=get_parent_otel_span_from_kwargs(retry_kwargs),
         )
-        healthy_deployments, all_deployments = deployments if isinstance(deployments, tuple) else ([], [])
         budget, policy_applies = self._anthropic_messages_retry_budget(_mid_stream_retry_trigger(e), initial_kwargs)
         last_error = e  # rebind-ok: the newest failure is what the fallback chain and the caller see
         for attempt in range(attempted_retries_for_request(initial_kwargs), budget):
-            trigger = _mid_stream_retry_trigger(last_error)
-            if not policy_applies and not self._anthropic_messages_should_retry(
-                trigger, healthy_deployments, all_deployments, initial_kwargs
-            ):
-                return _StreamRetriesExhausted(last_error)
-            self.log_retry(kwargs=retry_kwargs, e=trigger)
-            time.sleep(
-                self._time_to_sleep_before_retry(
-                    e=trigger,
-                    remaining_retries=budget - attempt,
-                    num_retries=budget,
-                    healthy_deployments=healthy_deployments,
-                    all_deployments=all_deployments,
+            if (
+                delay := self._chat_stream_retry_delay(
+                    _mid_stream_retry_trigger(last_error),
+                    attempt,
+                    budget,
+                    policy_applies,
+                    deployments,
+                    initial_kwargs,
+                    retry_kwargs,
                 )
-            )
+            ) is None:
+                return _StreamRetriesExhausted(last_error)
+            time.sleep(delay)
             record_retry_attempt(retry_kwargs, attempted_retries=attempt + 1, max_retries=budget)
             verbose_router_logger.debug(
                 "Retrying chat completions stream that failed before content, attempt %s of %s", attempt + 1, budget
             )
             try:
-                response = self._completion(**retry_kwargs)
+                response = self._completion(model_group, messages, **retry_kwargs)
             except Exception as retry_error:  # noqa: BLE001  # the fallback chain judges the failed retry
                 wrapped = _anthropic_stream_fallback_error_for_raised(retry_error, model_group, False, e.llm_provider)
                 if wrapped is None:
@@ -3172,7 +3220,11 @@ class Router:
                     )
                 last_error = wrapped
                 continue
-            return _StreamRetryOpened(response, attempted_retries=attempt + 1, max_retries=budget)
+            return _ChatStreamRetryOpened(
+                cast(CustomStreamWrapper, response),  # cast-ok: a stream request's attempt is the wrapped stream
+                attempted_retries=attempt + 1,
+                max_retries=budget,
+            )
         return _StreamRetriesExhausted(last_error)
 
     async def _acompletion_streaming_iterator(
@@ -3239,16 +3291,22 @@ class Router:
                 with anyio.CancelScope(shield=True):
                     await close_model_response()
                     await held_slot.aclose()
-                committed_failure: Final = _committed_stream_failure(e, model_response.chunks)
+                stream_chunks: Final = cast(
+                    "Sequence[ModelResponseStream]", model_response.chunks
+                )  # cast-ok: wrapper chunks
+                committed_failure: Final = _committed_stream_failure(e, stream_chunks)
                 if committed_failure is not None:
                     raise committed_failure from e
 
-                retry_outcome: Final = await self._aretry_chat_stream_before_content(e, messages, initial_kwargs)
-                if isinstance(retry_outcome, _StreamRetryOpened):
+                retry_outcome: Final = await self._aretry_chat_stream_before_content(
+                    e,
+                    messages,
+                    cast("Mapping[str, object]", initial_kwargs),  # cast-ok: snapshot kwargs
+                )
+                if isinstance(retry_outcome, _ChatStreamRetryOpened):
                     fallback_response = retry_outcome.response  # rebind-ok: closed in the finally below
-                    retried_hidden_params: Final = Router._adopt_retried_chat_stream(retry_outcome, wrapper_ref)
-                    retried_stream: Final = cast(AsyncIterator[object], retry_outcome.response)  # cast-ok: stream
-                    async for retried_item in retried_stream:
+                    retried_hidden_params: Final = Router._adopt_retried_chat_stream(retry_outcome, wrapper_ref())
+                    async for retried_item in retry_outcome.response:
                         Router._apply_fallback_hidden_params_to_item(retried_item, retried_hidden_params)
                         yield retried_item
                     return
@@ -3854,14 +3912,20 @@ class Router:
                 for item in model_response:
                     yield item
             except MidStreamFallbackError as e:
-                committed_failure: Final = _committed_stream_failure(e, model_response.chunks)
+                stream_chunks: Final = cast(
+                    "Sequence[ModelResponseStream]", model_response.chunks
+                )  # cast-ok: wrapper chunks
+                committed_failure: Final = _committed_stream_failure(e, stream_chunks)
                 if committed_failure is not None:
                     raise committed_failure from e
 
-                retry_outcome: Final = router_self._retry_chat_stream_before_content(e, messages, initial_kwargs)
-                if isinstance(retry_outcome, _StreamRetryOpened):
-                    fallback_response = retry_outcome.response  # rebind-ok: closed in the finally below
-                    yield from Router._retried_chat_stream_items(retry_outcome, wrapper_ref)
+                retry_outcome: Final = router_self._retry_chat_stream_before_content(
+                    e,
+                    messages,
+                    cast("Mapping[str, object]", initial_kwargs),  # cast-ok: snapshot kwargs
+                )
+                if isinstance(retry_outcome, _ChatStreamRetryOpened):
+                    yield from Router._retried_chat_stream_items(retry_outcome, wrapper_ref())
                     return
                 pre_content_failure: Final = retry_outcome.error
 
@@ -4112,7 +4176,10 @@ class Router:
                 )
 
                 if isinstance(response, CustomStreamWrapper):
-                    carry_over_routed_deployment(live_kwargs=kwargs, snapshot=input_kwargs_for_streaming_fallback)
+                    carry_over_routed_deployment(
+                        live_kwargs=cast("Mapping[str, object]", kwargs),  # cast-ok: the live request kwargs
+                        snapshot=input_kwargs_for_streaming_fallback,
+                    )
                     return await self._acompletion_streaming_iterator(
                         model_response=response,
                         messages=messages,
@@ -6046,8 +6113,8 @@ class Router:
     def _anthropic_messages_should_retry(
         self,
         trigger: Exception,
-        healthy_deployments: list[dict],  # mutable-ok: should_retry_this_error's own parameter type
-        all_deployments: list[dict],  # mutable-ok: should_retry_this_error's own parameter type
+        healthy_deployments: list[dict[str, object]],  # mutable-ok: should_retry_this_error's own parameter type
+        all_deployments: list[dict[str, object]],  # mutable-ok: should_retry_this_error's own parameter type
         kwargs: Mapping[str, object],
     ) -> bool:
         try:
@@ -8506,8 +8573,8 @@ class Router:
         e: Exception,
         remaining_retries: int,
         num_retries: int,
-        healthy_deployments: list | None = None,
-        all_deployments: list | None = None,
+        healthy_deployments: Sequence[Mapping[str, object]] | None = None,
+        all_deployments: Sequence[Mapping[str, object]] | None = None,
     ) -> int | float:
         """
         Calculate back-off, then retry
@@ -9132,7 +9199,7 @@ class Router:
 
     async def _async_get_healthy_deployments(
         self, model: str, parent_otel_span: Span | None
-    ) -> tuple[list[dict], list[dict]]:
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:  # mutable-ok: the retry loops' own parameter types
         """
         Returns Tuple of:
         - Tuple[List[Dict], List[Dict]]:
