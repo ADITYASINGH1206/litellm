@@ -14,6 +14,7 @@ import time
 import types
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Final, NoReturn, Protocol
 
 import httpx
@@ -77,6 +78,13 @@ from litellm.proxy._experimental.mcp_server.scope_challenge import (
     OAuthScopeResponse,
     finish_scope_response,
     is_tool_call_request,
+)
+from litellm.proxy._experimental.mcp_server.skills import (
+    GetSkillRequest,
+    GetSkillRequestParams,
+    GetSkillResult,
+    ListSkillsRequest,
+    ListSkillsResult,
 )
 from litellm.proxy._experimental.mcp_server.ui_session_utils import (
     ActingUser,
@@ -993,9 +1001,26 @@ if MCP_AVAILABLE:
                 ReadResourceRequest(params=params), context
             )
 
-    async def discover(ctx: ServerRequestContext, params: RequestParams) -> DiscoverResult:
+    async def list_skills(ctx: ServerRequestContext, params: PaginatedRequestParams) -> ListSkillsResult:
         async with _legacy_operation_context(ctx, trace=False) as context:
-            return await operations.GatewayOperations().execute(DiscoverRequest(params=params), context)
+            return await operations.GatewayOperations().execute(ListSkillsRequest(params=params), context)
+
+    async def get_skill(ctx: ServerRequestContext, params: GetSkillRequestParams) -> GetSkillResult:
+        async with _legacy_operation_context(ctx, trace=False) as context:
+            return await operations.GatewayOperations().execute(GetSkillRequest(params=params), context)
+
+    async def discover(ctx: ServerRequestContext, params: RequestParams) -> DiscoverResult:
+        client_capabilities: Final = ctx.session.client_capabilities
+        async with _legacy_operation_context(ctx, trace=False) as context:
+            return await operations.GatewayOperations().execute(
+                DiscoverRequest(params=params),
+                replace(
+                    context,
+                    client_extensions=frozenset(
+                        client_capabilities.extensions or {} if client_capabilities is not None else {}
+                    ),
+                ),
+            )
 
     server.add_request_handler("server/discover", RequestParams, discover)
     server.add_request_handler("tools/list", PaginatedRequestParams, handle_list_tools)
@@ -1005,6 +1030,8 @@ if MCP_AVAILABLE:
     server.add_request_handler("resources/list", PaginatedRequestParams, list_resources)
     server.add_request_handler("resources/templates/list", PaginatedRequestParams, list_resource_templates)
     server.add_request_handler("resources/read", ReadResourceRequestParams, read_resource)
+    server.add_request_handler("skills/list", PaginatedRequestParams, list_skills)  # pyright: ignore[reportUnknownMemberType]  # SDK Server.add_request_handler is untyped
+    server.add_request_handler("skills/get", GetSkillRequestParams, get_skill)  # pyright: ignore[reportUnknownMemberType]  # SDK Server.add_request_handler is untyped
 
     ########################################################
     ############ End of MCP Server Routes ##################
