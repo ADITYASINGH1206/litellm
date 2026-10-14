@@ -6,7 +6,7 @@ from fastapi import FastAPI
 
 from litellm.proxy.control_plane.audit.dependencies import get_audit_log
 from litellm.proxy.control_plane.audit.router import router as audit_router
-from litellm.proxy.control_plane.auth.dependencies import get_token_verifier
+from litellm.proxy.control_plane.auth.dependencies import get_telemetry, get_token_verifier
 from litellm.proxy.control_plane.auth.router import get_login_service
 from litellm.proxy.control_plane.auth.router import router as auth_router
 from litellm.proxy.control_plane.common.exceptions import install_exception_handlers
@@ -41,7 +41,9 @@ def create_app(container: Container, license_check: License) -> FastAPI:
         docs_url=f"{container.settings.api_prefix}/docs",
         openapi_url=f"{container.settings.api_prefix}/openapi.json",
     )
+    container.telemetry.instrument(app)
     app.dependency_overrides[get_token_verifier] = lambda: container.token_verifier
+    app.dependency_overrides[get_telemetry] = lambda: container.telemetry
     app.dependency_overrides[get_login_service] = lambda: container.login_service
     app.dependency_overrides[get_registry] = lambda: container.registry
     app.dependency_overrides[get_dataplane_client] = lambda: container.dataplane_client
