@@ -3291,10 +3291,8 @@ class Router:
                 with anyio.CancelScope(shield=True):
                     await close_model_response()
                     await held_slot.aclose()
-                stream_chunks: Final = cast(
-                    "Sequence[ModelResponseStream]", model_response.chunks
-                )  # cast-ok: wrapper chunks
-                committed_failure: Final = _committed_stream_failure(e, stream_chunks)
+                chunks: Final = cast("Sequence[ModelResponseStream]", model_response.chunks)  # cast-ok: wrapper chunks
+                committed_failure: Final = _committed_stream_failure(e, chunks)
                 if committed_failure is not None:
                     raise committed_failure from e
 
@@ -3912,10 +3910,8 @@ class Router:
                 for item in model_response:
                     yield item
             except MidStreamFallbackError as e:
-                stream_chunks: Final = cast(
-                    "Sequence[ModelResponseStream]", model_response.chunks
-                )  # cast-ok: wrapper chunks
-                committed_failure: Final = _committed_stream_failure(e, stream_chunks)
+                chunks: Final = cast("Sequence[ModelResponseStream]", model_response.chunks)  # cast-ok: wrapper chunks
+                committed_failure: Final = _committed_stream_failure(e, chunks)
                 if committed_failure is not None:
                     raise committed_failure from e
 
