@@ -481,8 +481,6 @@ def _prometheus_logging_configured() -> bool:
         litellm.success_callback,
         litellm.failure_callback,
         litellm.service_callback,
-        litellm._async_success_callback,
-        litellm._async_failure_callback,
     )
     return any(
         isinstance(callback, str) and callback in _PROMETHEUS_CALLBACK_NAMES
@@ -490,7 +488,7 @@ def _prometheus_logging_configured() -> bool:
     )
 
 
-class _BreakerMetrics:
+class RedisBreakerMetrics:
     """Prometheus metrics for the Redis circuit breaker.
 
     The collectors join the registry (the default one, which /metrics serves) only once LiteLLM's own
@@ -510,9 +508,9 @@ class _BreakerMetrics:
         self._collectors: _BreakerCollectors | None = None
         self._client_missing = False
 
-    def publish(self) -> None:
+    def publish(self) -> _BreakerCollectors | None:
         with self._lock:
-            _ = self._exported_collectors(logger_started=True)
+            return self._exported_collectors(logger_started=True)
 
     def record_state_change(self, old_state: str | None, new_state: str) -> None:
         with self._lock:
@@ -562,8 +560,8 @@ class _BreakerMetrics:
 
 
 @functools.lru_cache(maxsize=1)
-def _breaker_metrics() -> _BreakerMetrics:
-    return _BreakerMetrics(_prometheus_logging_configured)
+def _breaker_metrics() -> RedisBreakerMetrics:
+    return RedisBreakerMetrics(_prometheus_logging_configured)
 
 
 def publish_redis_breaker_metrics() -> None:

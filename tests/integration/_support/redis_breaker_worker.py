@@ -35,7 +35,7 @@ def run_breaker_worker(
     scenario: Scenario, api_base: str, prom_dir: Path, environment: Mapping[str, str] = os.environ
 ) -> WorkerReport:
     completed: Final = subprocess.run(
-        (sys.executable, __file__, scenario, api_base, environment["REDIS_HOST"], environment["REDIS_PORT"]),
+        (sys.executable, "-I", __file__, scenario, api_base, environment["REDIS_HOST"], environment["REDIS_PORT"]),
         env={**environment, "PROMETHEUS_MULTIPROC_DIR": str(prom_dir)},
         capture_output=True,
         text=True,
@@ -65,12 +65,12 @@ def main(scenario: str, api_base: str, redis_host: str, redis_port: str) -> None
     from litellm.caching.caching import Cache
 
     if scenario in ("callbacks_before_cache", "opted_out"):
-        litellm.callbacks = ["prometheus"]
+        litellm.callbacks = ["prometheus"]  # test-quality-ok: this worker process exits right after the report
     if scenario == "opted_out":
-        litellm.disable_redis_circuit_breaker_metrics = True
-    litellm.cache = Cache(type="redis", host=redis_host, port=redis_port)
+        litellm.disable_redis_circuit_breaker_metrics = True  # test-quality-ok: throwaway worker process
+    litellm.cache = Cache(type="redis", host=redis_host, port=redis_port)  # test-quality-ok: throwaway worker process
     if scenario == "callbacks_after_cache":
-        litellm.callbacks = ["prometheus"]
+        litellm.callbacks = ["prometheus"]  # test-quality-ok: throwaway worker process
     response: Final = litellm.completion(
         model="openai/gpt-5.6",
         api_base=api_base,
