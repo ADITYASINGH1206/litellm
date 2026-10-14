@@ -3066,6 +3066,15 @@ class Router:
             )
         return prepared
 
+    @staticmethod
+    def _retried_chat_stream_items(
+        opened: _StreamRetryOpened, wrapper_ref: "weakref.ref[FallbackAwareStreamWrapper]"
+    ) -> Iterator[object]:
+        hidden_params: Final = Router._adopt_retried_chat_stream(opened, wrapper_ref)
+        for item in cast(Iterable[object], opened.response):  # cast-ok: _completion returned a stream
+            Router._apply_fallback_hidden_params_to_item(item, hidden_params)
+            yield item
+
     def _chat_stream_retry_kwargs(
         self, model_group: str, messages: Sequence[Mapping[str, str]], initial_kwargs: Mapping[str, object]
     ) -> Mapping[str, object]:
@@ -3852,15 +3861,9 @@ class Router:
                 retry_outcome: Final = router_self._retry_chat_stream_before_content(e, messages, initial_kwargs)
                 if isinstance(retry_outcome, _StreamRetryOpened):
                     fallback_response = retry_outcome.response  # rebind-ok: closed in the finally below
-                    retried_hidden_params: Final = Router._adopt_retried_chat_stream(retry_outcome, wrapper_ref)
-                    retried_stream: Final = cast(Iterable[object], retry_outcome.response)  # cast-ok: stream request
-                    for retried_item in retried_stream:
-                        Router._apply_fallback_hidden_params_to_item(retried_item, retried_hidden_params)
-                        yield retried_item
+                    yield from Router._retried_chat_stream_items(retry_outcome, wrapper_ref)
                     return
                 pre_content_failure: Final = retry_outcome.error
-                if fallbacks_disabled_for_request(initial_kwargs):
-                    raise _mid_stream_retry_trigger(pre_content_failure) from pre_content_failure
 
                 from litellm.main import stream_chunk_builder
 
@@ -6113,9 +6116,7 @@ class Router:
             except Exception as retry_error:  # noqa: BLE001  # the fallback chain judges the failed retry
                 wrapped = _anthropic_stream_fallback_error_for_raised(retry_error, model_group, False)
                 if wrapped is None:
-                    return _StreamRetriesExhausted(
-                        _anthropic_stream_pre_content_error(retry_error, model_group)
-                    )
+                    return _StreamRetriesExhausted(_anthropic_stream_pre_content_error(retry_error, model_group))
                 last_error = wrapped
                 continue
             return _StreamRetryOpened(response, attempted_retries=attempt + 1, max_retries=budget)
