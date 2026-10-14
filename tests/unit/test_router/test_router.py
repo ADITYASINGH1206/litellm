@@ -1,18 +1,23 @@
-import ast, asyncio, importlib, time
+import ast
+import asyncio
 import copy
 import functools
 import gc
+import importlib
+import inspect
 import itertools
 import json
 import logging
 import os
 import sys
 import threading
+import time
+import traceback
 import warnings
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Final, List, Literal, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
@@ -31,13 +36,18 @@ from litellm.caching.caching import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.caching.redis_cache import _redis_circuit_breaker_guard
 from litellm.exceptions import GuardrailRaisedException, MidStreamFallbackError, ModifyResponseException
-from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.otel.plumbing.context import set_request_root_span
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.llms.anthropic.pass_through.messages.agentic_streaming_iterator import (
     SERVER_FULFILLED_TOOL_LEAK_ERROR_SSE_BYTES,
+)
+from litellm.llms.base_llm.vector_store.transformation import (
+    LiteLLMVectorStoreEmbeddingExecutor,
+    RouterVectorStoreEmbeddingExecutor,
 )
 from litellm.llms.bedrock.common_utils import BedrockError
 from litellm.models.access_group import LiteLLM_AccessGroupTable
@@ -46,6 +56,7 @@ from litellm.router import (
     MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS,
     MAX_HELD_PRE_OUTPUT_RESPONSES_EVENTS,
     FallbackAwareAnthropicMessagesStream,
+    Span,
     _anthropic_stream_commits_now,
     _anthropic_stream_error_is_gateway_verdict,
     _anthropic_stream_fallback_error_for_raised,
@@ -55,7 +66,6 @@ from litellm.router import (
     _is_retriable_anthropic_status,
     _responses_stream_holds_event,
     _without_line_breaks,
-    Span,
 )
 from litellm.router_strategy import simple_shuffle
 from litellm.router_utils.client_initalization_utils import MaxParallelRequestsLimit
@@ -83,19 +93,11 @@ from litellm.types.router import (
     RetryPolicy,
     RoutingContext,
 )
-from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-from litellm.llms.base_llm.vector_store.transformation import (
-    LiteLLMVectorStoreEmbeddingExecutor,
-    RouterVectorStoreEmbeddingExecutor,
-)
 from litellm.types.utils import CallTypes, CredentialItem
 from litellm.utils import _invalidate_model_cost_lowercase_map
 from tests._vcr_conftest_common import install_live_call_probe, record_vcr_outcome
 from tests.fake_openai_endpoint import FAKE_OPENAI_API_BASE
 from tests.large_text import text
-import traceback
-import inspect
-from typing import List, Optional
 
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -838,6 +840,7 @@ async def test_async_router_afile_content_uses_deployment_custom_llm_provider():
     This prevents "None is not a valid LlmProviders" errors when calling file content operations.
     """
     from unittest.mock import AsyncMock, MagicMock, patch
+
     from litellm.types.llms.openai import HttpxBinaryResponseContent
 
     router = litellm.Router(
@@ -9254,6 +9257,7 @@ async def test_health_probe_preserves_normal_caller_policy(
     strict_ids: tuple[str, ...],
 ) -> None:
     import time
+
     from litellm.types.router import AllowedFailsPolicy, RouterRateLimitError
 
     router: Final = Router(
@@ -20694,6 +20698,7 @@ class TestAutoRouterTraceProvenance:
     @pytest.fixture
     def _tracing(self, monkeypatch: pytest.MonkeyPatch) -> "tuple[OpenTelemetryV2, InMemorySpanExporter]":
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
         from litellm.integrations.otel import OpenTelemetryV2Config
         from litellm.integrations.otel.logger import OpenTelemetryV2
         from litellm.integrations.otel.plumbing import providers
@@ -26026,10 +26031,14 @@ def test_committed_stream_failure_direct_call():
     """A failure before the first chunk is never committed, a failure after tool-call deltas re-raises the
     provider's own error instead of handing the stream to a retry or a fallback."""
     from litellm.exceptions import MidStreamFallbackError
+    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
     from litellm.router import _committed_stream_failure
     from litellm.types.utils import ChatCompletionDeltaToolCall, Delta, Function
 
-    assert _committed_stream_failure(_chat_stream_pre_content_failure(), []) is None
+    stream = CustomStreamWrapper(
+        completion_stream=iter([]), model="chat", logging_obj=MagicMock(), custom_llm_provider="cached_response"
+    )
+    assert _committed_stream_failure(_chat_stream_pre_content_failure(), stream) is None
     provider_error = litellm.APIConnectionError(message="overloaded", llm_provider="openai", model="chat")
     committed = MidStreamFallbackError(
         message="overloaded",
@@ -26041,7 +26050,8 @@ def test_committed_stream_failure_direct_call():
     tool_call = ChatCompletionDeltaToolCall(
         id="call_1", type="function", index=0, function=Function(name="get_weather", arguments="")
     )
-    assert _committed_stream_failure(committed, [_chat_stream_chunk(Delta(tool_calls=[tool_call]))]) is provider_error
+    stream.chunks = [_chat_stream_chunk(Delta(tool_calls=[tool_call]))]
+    assert _committed_stream_failure(committed, stream) is provider_error
 
 
 def test_chat_stream_retry_kwargs_direct_call():

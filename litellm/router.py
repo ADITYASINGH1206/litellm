@@ -685,13 +685,14 @@ def _request_model_group(kwargs: Mapping[str, object]) -> str | None:
     return model_group if isinstance(model_group, str) else None
 
 
-def _committed_stream_failure(
-    error: "MidStreamFallbackError", chunks: Sequence[ModelResponseStream]
-) -> Exception | None:
+def _committed_stream_failure(error: "MidStreamFallbackError", stream: CustomStreamWrapper) -> Exception | None:
     """The error to re-raise once content has reached the client, when no retry or fallback may take over."""
-    if error.is_pre_first_chunk or not (error.generated_content or _stream_chunks_have_generated_content(chunks)):
+    if error.is_pre_first_chunk:
         return None
-    return _mid_stream_retry_trigger(error)
+    if error.generated_content:
+        return _mid_stream_retry_trigger(error)
+    chunks: Final = cast("Sequence[ModelResponseStream]", stream.chunks)  # cast-ok: the wrapper collects stream chunks
+    return _mid_stream_retry_trigger(error) if _stream_chunks_have_generated_content(chunks) else None
 
 
 def _mid_stream_retry_trigger(error: "MidStreamFallbackError") -> Exception:
@@ -3112,7 +3113,8 @@ class Router:
             trigger, healthy_deployments, all_deployments, initial_kwargs
         ):
             return None
-        self.log_retry(kwargs=retry_kwargs, e=trigger)
+        if get_metadata_variable_name_from_kwargs(retry_kwargs) in retry_kwargs:
+            self.log_retry(kwargs=retry_kwargs, e=trigger)
         return self._time_to_sleep_before_retry(
             e=trigger,
             remaining_retries=budget - attempt,
@@ -3291,8 +3293,7 @@ class Router:
                 with anyio.CancelScope(shield=True):
                     await close_model_response()
                     await held_slot.aclose()
-                chunks: Final = cast("Sequence[ModelResponseStream]", model_response.chunks)  # cast-ok: wrapper chunks
-                committed_failure: Final = _committed_stream_failure(e, chunks)
+                committed_failure: Final = _committed_stream_failure(e, model_response)
                 if committed_failure is not None:
                     raise committed_failure from e
 
@@ -3910,8 +3911,7 @@ class Router:
                 for item in model_response:
                     yield item
             except MidStreamFallbackError as e:
-                chunks: Final = cast("Sequence[ModelResponseStream]", model_response.chunks)  # cast-ok: wrapper chunks
-                committed_failure: Final = _committed_stream_failure(e, chunks)
+                committed_failure: Final = _committed_stream_failure(e, model_response)
                 if committed_failure is not None:
                     raise committed_failure from e
 
